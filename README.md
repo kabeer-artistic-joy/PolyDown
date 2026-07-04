@@ -1,4 +1,4 @@
-# 🎯 Polymarket Spread Scalper Bot
+# Polymarket Spread Scalper Bot
 
 A separate bot from the delta/momentum strategy bot, with its own logic — but
 it has evolved to reuse the same *kind* of signal (price movement magnitude +
@@ -7,7 +7,7 @@ forward-looking predictor rather than a same-window filter.
 
 ---
 
-## ⚠️ Read this before running `--live`
+## Read this before running `--live`
 
 This bot's loss shape is **fundamentally different and riskier** than the
 delta bot's:
@@ -30,7 +30,7 @@ delta bot's:
 
 ---
 
-## 🧠 Strategy
+## Strategy
 
 1. Wake 10 seconds before each new 5-minute BTC/ETH Up/Down window opens.
 2. As that window is about to close, check two things about the *ending*
@@ -68,7 +68,7 @@ to test with your own dry-run data, not a settled number.
 
 ---
 
-## 📋 Requirements
+## Requirements
 
 - Python 3.10+
 - A Polymarket account with USDC on Polygon (for `--live` mode)
@@ -77,7 +77,7 @@ to test with your own dry-run data, not a settled number.
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ```bash
 git clone https://github.com/kabeer-artistic-joy/PolyDrunk_Spreat_Bot.git
@@ -91,7 +91,7 @@ cp .env.example .env
 
 ---
 
-## 🖥️ Usage
+## Usage
 
 ```bash
 # Dry run — real order book + real Binance data, no real orders, no funds at risk
@@ -105,7 +105,7 @@ Press **Ctrl+C** to stop and print the session summary.
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 Key constants are defined at the top of `spread_bot.py`:
 
@@ -121,7 +121,7 @@ Key constants are defined at the top of `spread_bot.py`:
 
 ---
 
-## 🔧 Order mechanics — exactly what type of order is used where
+## Order mechanics — exactly what type of order is used where
 
 | Action | Order type | Why |
 |---|---|---|
@@ -131,7 +131,7 @@ Key constants are defined at the top of `spread_bot.py`:
 
 ---
 
-## 📊 What `--dry-run` actually measures
+## What `--dry-run` actually measures
 
 Dry-run mode polls Polymarket's real, live public order book and Binance's
 real price data throughout each window — it is not a simulation with assumed
@@ -147,7 +147,7 @@ prices. It records:
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 spread-bot/
@@ -165,7 +165,7 @@ force-exited.
 
 ---
 
-## 🔍 Known uncertainties in this implementation
+## Known uncertainties in this implementation
 
 Documented honestly rather than glossed over:
 
@@ -194,7 +194,7 @@ Documented honestly rather than glossed over:
 
 ---
 
-## ⚠️ Disclaimer
+## Disclaimer
 
 > This software is for educational and experimental purposes only. This is
 > **not financial advice**. This strategy's loss shape can approach full
