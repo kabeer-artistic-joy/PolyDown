@@ -2,36 +2,31 @@
 """
 Polymarket Down-Spread Scalper Bot
 ====================================
-A completely separate strategy from the delta/momentum bot. This bot does NOT
-use price direction signals, delta thresholds, momentum, or ATR. It tests one
-specific, narrow hypothesis:
+Buys DOWN unconditionally at the instant every 5-minute window opens — no
+delta, no momentum, no magnitude check, no observation period. Just:
 
-    At the instant a new 5-minute Up/Down window opens, buy the DOWN token as
-    cheaply as possible (target 50c, ceiling 52c). Then try to sell it back
-    for a profit once the market price moves toward 60c (accepting as low as
-    58c). If neither the buy nor the sell mechanics work out in time, exit
-    for whatever is available rather than hold to resolution.
+    Buy DOWN as cheaply as possible (target 50c, ceiling 52c) within 2
+    seconds of window open. Sell as soon as the price reaches 55c. If that
+    never happens, exit for whatever is available in the closing seconds
+    rather than hold to resolution.
 
 This is a SPREAD/VOLATILITY play, not a directional one — it does not care
 which side (Up or Down) ultimately wins. It only cares whether the DOWN price
-touches the 58-60c range at some point during the window before you're forced
-to exit in the closing seconds.
+touches 55c at some point during the window before you're forced to exit.
 
 IMPORTANT — read before running live:
-  A loss in this bot is NOT bounded like the delta bot's PRICE_MAX-protected
-  entries. If DOWN never reaches 58c during the window, this bot force-exits
-  in the final FORCE_EXIT_SECONDS at whatever price is available — which could
-  be far below your buy price. A single bad window can cost close to your
-  full stake. This has NOT been validated with real trade data yet. Run
-  --dry-run for a meaningful sample before ever using --live.
+  A loss in this bot is NOT bounded the way a directionally-confirmed entry
+  would be. If DOWN never reaches 55c during the window, this bot force-exits
+  in the final FORCE_EXIT_SECONDS at whatever price is available — which
+  could be far below your buy price. A single bad window can cost close to
+  your full stake. Run --dry-run for a meaningful sample before --live.
 
 Modes:
   --dry-run   No real orders. Polls the REAL, LIVE order book throughout each
-              window and computes what WOULD have happened (fill/miss on the
-              buy, each 58-60c opportunity, and the eventual exit) using real
-              market depth data — not simulated or assumed prices.
+              window and computes what WOULD have happened using real market
+              depth data — not simulated or assumed prices.
   --live      Places real limit orders per the exact logic below, using your
-              Polymarket deposit wallet (same auth mechanism as the other bot).
+              Polymarket deposit wallet.
 
 Usage:
   python spread_bot.py --dry-run
@@ -64,13 +59,15 @@ BUY_TARGET_PRICE   = 0.50   # what we hope to pay
 BUY_CEILING_PRICE  = 0.52   # max we're willing to pay — this is the actual limit price used
 BUY_TIMEOUT_SEC    = 2.0    # cancel the buy attempt if unfilled after this long
 
-SELL_TARGET_PRICE  = 0.60   # what we hope to sell at
-SELL_FLOOR_PRICE   = 0.58   # minimum acceptable profitable sell
+PROFIT_MARGIN      = 0.05   # sell as soon as (current bid) >= (actual buy price) + this margin.
+                              # Relative to YOUR entry, not a fixed absolute price — if you buy at
+                              # 0.47, the trigger is 0.52; if you buy at 0.52, the trigger is 0.57.
+                              # Same profit either way, since it's measured from where you actually got in.
 
 FORCE_EXIT_SECONDS_LEFT = 60  # in the final N seconds of the window, exit at any price if still holding
 
 POLL_INTERVAL_FAST = 0.05   # tight poll interval used right at window open (seconds)
-POLL_INTERVAL_SLOW = 1.0    # normal poll interval while watching for a 58-60c opportunity
+POLL_INTERVAL_SLOW = 1.0    # normal poll interval while watching for a sell opportunity
 
 # ─── UTILITIES ───────────────────────────────────────────────────────────────
 
@@ -89,11 +86,7 @@ def now_unix():
 
 
 def get_window_market(slug_prefix: str, start_ts: int) -> dict | None:
-    """
-    Find the Up/Down market for a window starting at start_ts. Returns both
-    outcome token IDs by name (unlike the delta bot, which only tracked the
-    'winning' side — this bot always wants the Down token specifically).
-    """
+    """Find the Up/Down market for a window starting at start_ts."""
     slug = f"{slug_prefix}-{start_ts}"
     try:
         r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=3)
@@ -136,8 +129,7 @@ def get_window_market(slug_prefix: str, start_ts: int) -> dict | None:
 
 
 def get_order_book(token_id: str) -> dict:
-    """Raw public order book fetch — no auth required. Used for both dry-mode
-    simulation and live-mode depth checks."""
+    """Raw public order book fetch — no auth required."""
     try:
         r = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=2)
         r.raise_for_status()
@@ -212,9 +204,9 @@ class SpreadBot:
             self._init_client()
 
         log("=" * 70)
-        log(f"Down-Spread Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
+        log(f"Down-Only Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
         log(f"Buy: target ${BUY_TARGET_PRICE} ceiling ${BUY_CEILING_PRICE} timeout {BUY_TIMEOUT_SEC}s")
-        log(f"Sell: target ${SELL_TARGET_PRICE} floor ${SELL_FLOOR_PRICE} | force-exit last {FORCE_EXIT_SECONDS_LEFT}s")
+        log(f"Sell trigger: entry price + ${PROFIT_MARGIN} margin | force-exit last {FORCE_EXIT_SECONDS_LEFT}s")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -237,24 +229,21 @@ class SpreadBot:
     # ── BUY PHASE ────────────────────────────────────────────────────────────
 
     def _attempt_buy(self, market: dict, window_open_time: float) -> dict:
-        """
-        Attempt to buy DOWN at up to BUY_CEILING_PRICE within BUY_TIMEOUT_SEC
-        of window open. Returns a dict describing what happened, with real
-        elapsed time in milliseconds from window_open_time.
-        """
+        """Attempt to buy DOWN at up to BUY_CEILING_PRICE within BUY_TIMEOUT_SEC of window open."""
         crypto = market["crypto"]
         token  = market["down_token"]
 
         if self.dry_run:
-            # Poll the REAL live order book repeatedly for up to BUY_TIMEOUT_SEC,
-            # looking for a real ask at or below our ceiling. No order is placed.
             deadline = window_open_time + BUY_TIMEOUT_SEC
+            last_seen_price = None
             while now_unix() < deadline:
                 book = get_order_book(token)
                 price, size = best_ask(book)
+                if price is not None:
+                    last_seen_price = price
                 elapsed_ms = (now_unix() - window_open_time) * 1000
                 if price is not None and price <= BUY_CEILING_PRICE:
-                    MIN_SHARES = 1  # NOT independently confirmed by Polymarket docs — this is a minimal safety floor only, not a verified exchange rule. The old "5" had no documented source and should not have been asserted with confidence. Test a real small live order to find the true threshold, if one exists.
+                    MIN_SHARES = 1
                     shares = max(MIN_SHARES, round(self.amount / price))
                     actual_cost = round(shares * price, 2)
                     if actual_cost > self.amount * 1.5:
@@ -265,19 +254,14 @@ class SpreadBot:
                     return {"result": "bought", "price": price, "shares": shares, "elapsed_ms": elapsed_ms}
                 time.sleep(POLL_INTERVAL_FAST)
             elapsed_ms = (now_unix() - window_open_time) * 1000
-            log(f"[DRY] BUY missed: no ask <= ${BUY_CEILING_PRICE} within {BUY_TIMEOUT_SEC}s "
+            price_info = f"last real ask seen was ${last_seen_price:.3f}" if last_seen_price is not None else "no asks seen at all"
+            log(f"[DRY] BUY missed: no ask <= ${BUY_CEILING_PRICE} within {BUY_TIMEOUT_SEC}s ({price_info}) "
                 f"(waited {elapsed_ms:.0f}ms)", crypto)
             return {"result": "missed", "price": None, "shares": 0, "elapsed_ms": elapsed_ms}
 
-        # LIVE: place a real resting limit buy at the ceiling price, poll for
-        # a fill, cancel if it doesn't fill within the timeout.
+        # LIVE
         from py_clob_client_v2 import OrderArgsV2, Side, OrderType
-        # Whole-share sizing guarantees price × size lands on a clean 2-decimal
-        # dollar amount (price already has ≤2dp; integer × 2dp never adds more
-        # decimal places) — fixes the same maker-amount precision bug found
-        # and fixed on the delta bot. This also enforces the exchange's real
-        # 5-share minimum order size, which your stake must clear.
-        MIN_SHARES = 1  # NOT independently confirmed by Polymarket docs — this is a minimal safety floor only, not a verified exchange rule. The old "5" had no documented source and should not have been asserted with confidence. Test a real small live order to find the true threshold, if one exists.
+        MIN_SHARES = 1  # NOT independently confirmed by Polymarket docs — a minimal safety floor only.
         size = max(MIN_SHARES, round(self.amount / BUY_CEILING_PRICE))
         actual_cost = round(size * BUY_CEILING_PRICE, 2)
         if actual_cost > self.amount * 1.5:
@@ -297,12 +281,6 @@ class SpreadBot:
         status   = str(resp.get("status", "")).lower()
         if status == "matched":
             elapsed_ms = (now_unix() - window_open_time) * 1000
-            # Parse the ACTUAL fill price/size rather than assuming the ceiling
-            # was paid — Polymarket's own matching rules give price improvement
-            # to the taker (e.g. a resting ask at 0.50 fills you at 0.50, not
-            # your 0.52 ceiling). Confirmed reliable for LIMIT orders on the
-            # delta bot's earliest live trade; unlike MARKET orders, this
-            # response type has not been observed returning $0 here.
             try:
                 fill_cost  = round(float(resp["makingAmount"]) / 1_000_000, 2)
                 fill_size  = round(float(resp["takingAmount"]) / 1_000_000, 4)
@@ -315,7 +293,6 @@ class SpreadBot:
                 f"order {order_id[:16]}... ({elapsed_ms:.0f}ms)", crypto)
             return {"result": "bought", "price": fill_price, "shares": fill_size, "elapsed_ms": elapsed_ms}
 
-        # Still resting — poll until timeout, then cancel if unfilled.
         deadline = window_open_time + BUY_TIMEOUT_SEC
         while now_unix() < deadline:
             time.sleep(0.25)
@@ -324,25 +301,11 @@ class SpreadBot:
             except Exception:
                 detail = None
             if detail is None:
-                # NOTE: get_order() has been observed returning None once an
-                # order is no longer in the open-orders index — which appears
-                # to happen once an order is fully matched. This is an
-                # inference, not confirmed by Polymarket docs for this case.
-                #
-                # KNOWN GAP: unlike the immediate-match case above, there is no
-                # response object here to parse an actual fill price from — the
-                # original `resp` was captured while the order was still
-                # "live" (resting), before it matched, so its amounts reflect
-                # the requested order, not the eventual fill. This falls back
-                # to the ceiling price, which may UNDERSTATE profit if the
-                # order filled at a better price sometime during the rest
-                # period. Not yet fixed — would need a get_trades() lookup.
                 elapsed_ms = (now_unix() - window_open_time) * 1000
                 log(f"✅ BUY appears filled (order no longer open), order {order_id[:16]}... ({elapsed_ms:.0f}ms) "
-                    f"— price assumed at ceiling \\${BUY_CEILING_PRICE}, may understate actual profit", crypto)
+                    f"— price assumed at ceiling ${BUY_CEILING_PRICE}, may understate actual profit", crypto)
                 return {"result": "bought", "price": BUY_CEILING_PRICE, "shares": size, "elapsed_ms": elapsed_ms}
 
-        # Timed out — cancel whatever is left resting.
         from py_clob_client_v2 import OrderPayload
         try:
             self.client.cancel_order(OrderPayload(orderID=order_id))
@@ -356,19 +319,16 @@ class SpreadBot:
     # ── SELL PHASE ───────────────────────────────────────────────────────────
 
     def _watch_for_sell(self, market: dict, buy_info: dict, window_open_time: float) -> dict:
-        """
-        After a successful buy, watch for the DOWN price to reach the sell
-        floor/target. Tracks every distinct opportunity, attempts to sell on
-        each one until successful, and force-exits in the closing seconds if
-        no opportunity worked out.
-        """
+        """After a successful buy, watch for the DOWN price to reach buy_price + PROFIT_MARGIN."""
         crypto      = market["crypto"]
         token       = market["down_token"]
         close_ts    = market["close_ts"]
         buy_price   = buy_info["price"]
         shares      = buy_info["shares"]
+        sell_trigger = round(buy_price + PROFIT_MARGIN, 4)  # relative to THIS trade's actual entry, not a fixed price
+        log(f"Sell trigger for this trade: ${sell_trigger} (bought ${buy_price} + ${PROFIT_MARGIN} margin)", crypto)
         opportunities = 0
-        in_opportunity_zone = False  # tracks edge-triggering so we log each distinct touch, not every poll
+        in_opportunity_zone = False
 
         while True:
             seconds_left = close_ts - now_unix()
@@ -378,36 +338,32 @@ class SpreadBot:
             book = get_order_book(token)
             price, size = best_bid(book)
 
-            if price is not None and price >= SELL_FLOOR_PRICE:
+            if price is not None and price >= sell_trigger:
                 if not in_opportunity_zone:
                     opportunities += 1
                     in_opportunity_zone = True
                     log(f"Opportunity #{opportunities}: bid ${price:.3f} (size {size}) — attempting sell", crypto)
 
-                sell_result = self._attempt_sell(token, shares, price, crypto)
+                sell_result = self._attempt_sell(token, shares, price, crypto, sell_trigger)
                 if sell_result["result"] == "sold":
                     pnl = round((sell_result["price"] - buy_price) * shares, 4)
                     return {**sell_result, "opportunities": opportunities, "pnl_usd": pnl,
                             "notes": f"sold on opportunity #{opportunities}"}
-                # sell attempt failed (e.g. size vanished before we could act) — keep watching
             else:
                 in_opportunity_zone = False
 
             time.sleep(POLL_INTERVAL_SLOW)
 
-        # Reached the force-exit window still holding — exit at whatever's available.
         log(f"⏰ Force-exit window reached ({FORCE_EXIT_SECONDS_LEFT}s left), still holding — exiting at best price", crypto)
         exit_result = self._force_exit(token, shares, crypto)
         pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
         return {**exit_result, "opportunities": opportunities, "pnl_usd": pnl, "notes": "force-exit, no opportunity filled"}
 
-    def _attempt_sell(self, token: str, shares: float, observed_price: float, crypto: str) -> dict:
+    def _attempt_sell(self, token: str, shares: float, observed_price: float, crypto: str, sell_trigger: float) -> dict:
         if self.dry_run:
-            # Real depth check: would our share count actually have filled at
-            # this observed bid, or was there insufficient size resting there?
             book = get_order_book(token)
             price, size = best_bid(book)
-            if price is not None and price >= SELL_FLOOR_PRICE and size >= shares:
+            if price is not None and price >= sell_trigger and size >= shares:
                 log(f"[DRY] SELL would fill: bid ${price:.3f} (sufficient depth for {shares} shares)", crypto)
                 return {"result": "sold", "price": price}
             log(f"[DRY] SELL opportunity did not have enough depth ({size} < {shares} needed) — missed", crypto)
@@ -416,7 +372,7 @@ class SpreadBot:
         from py_clob_client_v2 import OrderArgsV2, Side, OrderType
         try:
             resp = self.client.create_and_post_order(
-                OrderArgsV2(token_id=token, price=SELL_FLOOR_PRICE, size=shares, side=Side.SELL),
+                OrderArgsV2(token_id=token, price=sell_trigger, size=shares, side=Side.SELL),
                 order_type=OrderType.FAK,
             )
         except Exception as e:
@@ -430,8 +386,7 @@ class SpreadBot:
         return {"result": "missed", "price": None}
 
     def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
-        """Exit at any available price — no floor, no ceiling. This is a
-        deliberate loss-minimization exit, not a profit attempt."""
+        """Exit at any available price — no floor, no ceiling."""
         if self.dry_run:
             book = get_order_book(token)
             price, size = best_bid(book)
@@ -468,13 +423,6 @@ class SpreadBot:
     def _handle_window(self, slug_prefix: str, start_ts: int):
         crypto = MARKETS[slug_prefix]
 
-        # Busy-wait right up to the window boundary so the buy attempt fires
-        # as close to window open as this VPS/network can achieve. Being
-        # honest about a real limit: competing for the very first liquidity
-        # in the opening 1-2 seconds also depends on network latency to
-        # Polymarket's servers and how fast market makers seed that liquidity
-        # — this loop cannot guarantee winning that race, only minimize our
-        # own added delay.
         while now_unix() < start_ts - 1:
             time.sleep(0.2)
         while now_unix() < start_ts:
@@ -482,8 +430,6 @@ class SpreadBot:
 
         window_open_time = now_unix()
 
-        # The market listing itself may lag slightly behind the actual time
-        # boundary — retry briefly rather than assume it's instantly available.
         market = None
         find_deadline = window_open_time + 3
         while now_unix() < find_deadline:
@@ -550,7 +496,6 @@ class SpreadBot:
                 self._handle_window(slug_prefix, start_ts)
             except Exception as e:
                 log(f"⚠️ Unhandled error this window: {e}", crypto)
-            # Sleep briefly past window close before recalculating the next boundary
             time.sleep(2)
 
     # ── RUN / SUMMARY ────────────────────────────────────────────────────────
@@ -573,15 +518,13 @@ class SpreadBot:
             trades = list(self.trades)
         log(f"SUMMARY — {len(trades)} windows attempted")
         bought  = [t for t in trades if t["buy_result"] == "bought"]
-        sold_60 = [t for t in bought if t["sell_result"] == "sold" and float(t["sell_price"] or 0) >= SELL_TARGET_PRICE]
-        sold_58 = [t for t in bought if t["sell_result"] == "sold" and float(t["sell_price"] or 0) < SELL_TARGET_PRICE]
+        sold    = [t for t in bought if t["sell_result"] == "sold"]
         forced  = [t for t in bought if t["sell_result"] in ("exited", "no_bids", "unmatched")]
         total_pnl = sum(float(t["pnl_usd"] or 0) for t in trades)
 
         log(f"  Buy fills: {len(bought)}/{len(trades)}")
-        log(f"  Sold at/above target (~60c): {len(sold_60)}")
-        log(f"  Sold at floor (58-60c range): {len(sold_58)}")
-        log(f"  Force-exited (never reached floor): {len(forced)}")
+        log(f"  Sold at/above entry+${PROFIT_MARGIN} margin: {len(sold)}")
+        log(f"  Force-exited (never reached trigger): {len(forced)}")
         log(f"  Total PnL: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
         log("-" * 70)
 
@@ -589,7 +532,7 @@ class SpreadBot:
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Polymarket Down-Spread Scalper Bot")
+    parser = argparse.ArgumentParser(description="Polymarket Down-Only Scalper Bot")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Observe real order book data, place no real orders")
     mode.add_argument("--live", action="store_true", help="Place real orders with real funds")
